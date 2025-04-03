@@ -11,3 +11,11 @@ Goal:
   - Cluster Upgrade
   - API Gateway
   - CRDs
+
+## Notes
+> Trigger a preseed file using boot parameter
+![alt text](image.png)
+
+```
+auto=true DEBIAN_FRONTEND=text preseed/file=/cdrom/preseed.cfg
+```

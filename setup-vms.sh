@@ -36,15 +36,15 @@ LOG_FILE="vm_setup.log"
 PRESEED_DIR="${PWD}/preseed"
 CLOUDINIT_DIR="${PWD}/cloudinit"
 FLOPPY_IMAGE="${PRESEED_DIR}/preseed.img"
-
 # Check for dependencies
 check_dependencies() {
-    local dependencies=("VBoxManage" "curl" "wget" "sha256sum" "mkfs.msdos" "mcopy" "genisoimage")
+    local dependencies=("VBoxManage" "curl" "wget" "sha256sum" "mkfs.msdos" "mcopy" "genisoimage" "bsdtar" "sed")
     for dep in "${dependencies[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             exit_on_error "Dependency '$dep' is not installed. Please install it and re-run the script."
         fi
     done
+    log_message "All required dependencies are installed."
 }
 
 # Validate and download Debian ISO
@@ -76,8 +76,8 @@ validate_and_download_iso() {
     fi
 }
 
-# Generate preseed file
-generate_preseed_file() {
+# Generate preseed dependencies (file and ISO)
+generate_preseed() {
     mkdir -p "$PRESEED_DIR"
     cat <<EOF > "$PRESEED_DIR/preseed.cfg"
 d-i debian-installer/locale string en_US.UTF-8
@@ -107,18 +107,28 @@ d-i finish-install/reboot_in_progress note
 # d-i debian-installer/exit/reboot boolean true
 EOF
     log_message "Preseed file generated successfully in $PRESEED_DIR."
+
+    create_preseed_iso
+}
+
+# Create ISO image from preseed file
+create_preseed_iso(){
+    genisoimage -output "${PRESEED_DIR}/preseed.iso" -volid cidata -joliet -rock "$PRESEED_DIR/preseed.cfg" \
+    || exit_on_error "Failed to create preseed ISO."
+    log_message "Preseed ISO created."
 }
 
 # Create floppy disk image for the preseed file
-create_floppy_disk() {
-    log_message "Creating floppy disk image for preseed."
-    mkfs.msdos -C "$FLOPPY_IMAGE" 1440 || exit_on_error "Failed to create floppy disk image."
-    mcopy -i "$FLOPPY_IMAGE" "$PRESEED_DIR/preseed.cfg" :: || exit_on_error "Failed to copy preseed file to floppy disk."
-    log_message "Floppy disk image created successfully."
-}
+# create_floppy_disk() {
+#     log_message "Creating floppy disk image for preseed."
+#     # mkfs.msdos -C "$FLOPPY_IMAGE" 1440 || exit_on_error "Failed to create floppy disk image."
+#     mkfs.ext2 -F "$FLOPPY_IMAGE" 1440 || exit_on_error "Failed to create floppy disk image."
+#     mcopy -i "$FLOPPY_IMAGE" "$PRESEED_DIR/preseed.cfg" :: || exit_on_error "Failed to copy preseed file to floppy disk."
+#     log_message "Floppy disk image created successfully."
+# }
 
 # Generate and package cloud-init files into ISO
-generate_cloud_init_iso() {
+generate_cloud_init() {
     for VM in "${VM_NAMES[@]}"; do
         VM_NAME="$VM"
         [ -n "$PREFIX" ] && VM_NAME="${PREFIX}-${VM}"
@@ -223,34 +233,57 @@ create_vms() {
         VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 1 --device 0 --type dvddrive --medium "$ISO_DIR/$ISO_NAME" \
             || exit_on_error "Failed to attach ISO for VM $VM_NAME."
 
-        # Attach preseed and cloud-init files
-        attach_files_to_vm "$VM_NAME"
+        # Attach preseed ISO as a virtual CD-ROM to the SATA Controller
+        VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${PRESEED_DIR}/preseed.iso" \
+            || exit_on_error "Failed to attach preseed ISO to VM $VM_NAME."
+
+        # Attach the cloud-init ISO as a virtual CD-ROM to the SATA Controller
+        VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 3 --device 0 --type dvddrive --medium "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" \
+            || exit_on_error "Failed to attach cloud-init ISO to VM $VM_NAME."
+
+        # # Attach preseed and cloud-init files
+        # attach_files_to_vm "$VM_NAME"
+
+        # Add kernel boot parameters for the preseed file
+        log_message "Adding kernel boot parameters for preseed to VM $VM_NAME."
+        VBoxManage setextradata "$VM_NAME" "VBoxInternal/Devices/pcbios/0/Config/DmiBIOSVersion" "auto=true DEBIAN_FRONTEND=text preseed/file=/cdrom/preseed.cfg" \
+            || exit_on_error "Failed to add boot parameters to VM $VM_NAME."
 
         # Set the boot order to prioritize the Debian ISO
-        VBoxManage modifyvm "$VM_NAME" --boot1 dvd --boot2 disk || exit_on_error "Failed to set boot order for VM $VM_NAME."
+        VBoxManage modifyvm "$VM_NAME" --boot1 dvd --boot2 dvd --boot3 disk || exit_on_error "Failed to set boot order for VM $VM_NAME."
     done
 }
 
 # Attach preseed and cloud-init files to a VM
-attach_files_to_vm() {
-    VM_NAME="$1"
+# attach_files_to_vm() {
+    # VM_NAME="$1"
 
     # Add a Floppy Controller to the VM
-    log_message "Adding Floppy Controller to VM $VM_NAME."
-    VBoxManage storagectl "$VM_NAME" --name "Floppy Controller" --add floppy \
-        || exit_on_error "Failed to add Floppy Controller to VM $VM_NAME."
+    # log_message "Adding Floppy Controller to VM $VM_NAME."
+    # VBoxManage storagectl "$VM_NAME" --name "Floppy Controller" --add floppy \
+    #     || exit_on_error "Failed to add Floppy Controller to VM $VM_NAME."
 
     # Attach the preseed floppy disk to the Floppy Controller
-    log_message "Attaching preseed floppy disk to VM $VM_NAME."
-    VBoxManage storageattach "$VM_NAME" --storagectl "Floppy Controller" --port 0 --device 0 --type fdd --medium "$FLOPPY_IMAGE" \
-        || exit_on_error "Failed to attach preseed floppy disk to VM $VM_NAME."
+    # log_message "Attaching preseed floppy disk to VM $VM_NAME."
+    # VBoxManage storageattach "$VM_NAME" --storagectl "Floppy Controller" --port 0 --device 0 --type fdd --medium "$FLOPPY_IMAGE" \
+    #     || exit_on_error "Failed to attach preseed floppy disk to VM $VM_NAME."
+
+    # Attach preseed ISO as a virtual CD-ROM to the SATA Controller
+    # VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${PRESEED_DIR}/preseed.iso" \
+    # || exit_on_error "Failed to attach preseed ISO to VM $VM_NAME."
+
 
     # Attach the cloud-init ISO as a virtual CD-ROM to the SATA Controller
-    VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" \
-        || exit_on_error "Failed to attach cloud-init ISO to VM $VM_NAME."
+    # VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 3 --device 0 --type dvddrive --medium "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" \
+    #     || exit_on_error "Failed to attach cloud-init ISO to VM $VM_NAME."
 
-    log_message "Attached preseed floppy disk and cloud-init ISO to VM $VM_NAME."
-}
+    # Add kernel boot parameters for the preseed file
+#     log_message "Adding kernel boot parameters for preseed to VM $VM_NAME."
+#     VBoxManage setextradata "$VM_NAME" "VBoxInternal/Devices/pcbios/0/Config/DmiBIOSVersion" "auto priority=critical preseed/file=/cdrom/preseed.cfg" \
+#         || exit_on_error "Failed to add boot parameters to VM $VM_NAME."
+
+#     log_message "Attached preseed and cloud-init ISO to VM $VM_NAME with updated boot parameters."
+# }
 
 # Output a summary of created VMs
 output_summary() {
@@ -272,18 +305,19 @@ main() {
 
     # Validate the chosen IP range
     validate_ip_range
+    # TODO Add this function back in ^
 
     # Download and validate the ISO
     validate_and_download_iso
 
-    # Generate the preseed file
-    generate_preseed_file
+    # Generate and package preseed file
+    generate_preseed
 
-    # Create the floppy disk image
-    create_floppy_disk
+    # # Create the floppy disk image
+    # create_floppy_disk
 
     # Generate and package cloud-init files into ISO
-    generate_cloud_init_iso
+    generate_cloud_init
 
     # Create the host-only network
     create_host_only_network
