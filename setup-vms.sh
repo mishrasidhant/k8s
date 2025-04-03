@@ -34,11 +34,12 @@ VM_NAMES=("controller" "worker1" "worker2" "nfs")
 PREFIX=""
 LOG_FILE="vm_setup.log"
 PRESEED_DIR="${PWD}/preseed"
+CLOUDINIT_DIR="${PWD}/cloudinit"
 FLOPPY_IMAGE="${PRESEED_DIR}/preseed.img"
 
 # Check for dependencies
 check_dependencies() {
-    local dependencies=("VBoxManage" "curl" "wget" "sha256sum" "mkfs.msdos" "mcopy")
+    local dependencies=("VBoxManage" "curl" "wget" "sha256sum" "mkfs.msdos" "mcopy" "genisoimage")
     for dep in "${dependencies[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             exit_on_error "Dependency '$dep' is not installed. Please install it and re-run the script."
@@ -116,8 +117,8 @@ create_floppy_disk() {
     log_message "Floppy disk image created successfully."
 }
 
-# Generate cloud-init files
-generate_cloud_init_files() {
+# Generate and package cloud-init files into ISO
+generate_cloud_init_iso() {
     for VM in "${VM_NAMES[@]}"; do
         VM_NAME="$VM"
         [ -n "$PREFIX" ] && VM_NAME="${PREFIX}-${VM}"
@@ -139,7 +140,7 @@ generate_cloud_init_files() {
                 PACKAGES="curl nfs-kernel-server"
                 ;;
         esac
-        cat <<EOF > "$VM_NAME-cloud-init.yaml"
+        cat <<EOF > "$CLOUDINIT_DIR/$VM_NAME-cloud-init.yaml"
 #cloud-config
 hostname: ${VM_NAME}.k8s.local
 manage_etc_hosts: true
@@ -157,6 +158,11 @@ packages:
   - ${PACKAGES}
 EOF
         log_message "Cloud-init file generated for $VM_NAME."
+
+        # Package the YAML file into an ISO
+        genisoimage -output "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" -volid cidata -joliet -rock "${CLOUDINIT_DIR}/$VM_NAME-cloud-init.yaml" \
+            || exit_on_error "Failed to create cloud-init ISO for VM $VM_NAME."
+        log_message "Cloud-init ISO created for VM $VM_NAME."
     done
 }
 
@@ -239,11 +245,11 @@ attach_files_to_vm() {
     VBoxManage storageattach "$VM_NAME" --storagectl "Floppy Controller" --port 0 --device 0 --type fdd --medium "$FLOPPY_IMAGE" \
         || exit_on_error "Failed to attach preseed floppy disk to VM $VM_NAME."
 
-    # Attach the cloud-init file as a virtual CD-ROM to the SATA Controller
-    VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${VM_NAME}-cloud-init.yaml" \
-        || exit_on_error "Failed to attach cloud-init file to VM $VM_NAME."
+    # Attach the cloud-init ISO as a virtual CD-ROM to the SATA Controller
+    VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" \
+        || exit_on_error "Failed to attach cloud-init ISO to VM $VM_NAME."
 
-    log_message "Attached preseed floppy disk and cloud-init file to VM $VM_NAME."
+    log_message "Attached preseed floppy disk and cloud-init ISO to VM $VM_NAME."
 }
 
 # Output a summary of created VMs
@@ -276,8 +282,8 @@ main() {
     # Create the floppy disk image
     create_floppy_disk
 
-    # Generate cloud-init files
-    generate_cloud_init_files
+    # Generate and package cloud-init files into ISO
+    generate_cloud_init_iso
 
     # Create the host-only network
     create_host_only_network

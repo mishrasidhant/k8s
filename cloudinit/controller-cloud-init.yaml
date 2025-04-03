@@ -1,0 +1,15 @@
+#cloud-config
+hostname: controller.k8s.local
+manage_etc_hosts: true
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - 192.168.60.100/24
+      gateway4: 192.168.60.1
+      nameservers:
+        addresses:
+          - 8.8.8.8
+packages:
+  - curl nfs-common
