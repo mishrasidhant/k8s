@@ -18,6 +18,8 @@ ISO_DIR="${PWD}"
 ISO_NAME="debian-12.10.0-amd64-netinst.iso"
 ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso"
 CHECKSUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS"
+USERNAME="username"
+PASSWORD="password"
 MEMORY_WORKERS="2048"
 CPUS_WORKERS="1"
 DISK_SIZE_WORKERS="10000"
@@ -68,6 +70,81 @@ validate_and_download_iso() {
     else
         log_message "Checksum validated successfully."
     fi
+}
+
+# Generate preseed file
+generate_preseed_file() {
+    cat <<EOF > preseed.cfg
+d-i debian-installer/locale string en_US.UTF-8
+d-i debian-installer/keymap select us
+d-i time/zone string UTC
+d-i partman-auto/disk string /dev/sda
+d-i partman-auto/method string regular
+d-i partman-auto/expert_recipe string boot-root :: \
+      100 500 10000 ext4 \
+      $primary{ } $bootable{ } \
+      method{ format } format{ } \
+      use_filesystem{ } filesystem{ ext4 } \
+      mountpoint{ / } \
+      .
+d-i partman/choose_partition select finish
+d-i partman/confirm write_partition yes
+d-i passwd/user-fullname string $USERNAME
+d-i passwd/username string $USERNAME
+d-i passwd/user-password password $PASSWORD
+d-i passwd/user-password-again password $PASSWORD
+d-i passwd/user-default-groups string sudo
+d-i grub-installer/bootdev string default
+d-i pkgsel/include string openssh-server
+d-i pkgsel/install-language-support boolean false
+d-i finish-install/reboot_in_progress note
+d-i debian-installer/exit/reboot boolean true
+EOF
+    log_message "Preseed file generated successfully."
+}
+
+# Generate cloud-init files
+generate_cloud_init_files() {
+    for VM in "${VM_NAMES[@]}"; do
+        VM_NAME="$VM"
+        [ -n "$PREFIX" ] && VM_NAME="${PREFIX}-${VM}"
+        case "$VM" in
+            controller)
+                IP="192.168.60.100"
+                PACKAGES="curl nfs-common"
+                ;;
+            worker1)
+                IP="192.168.60.101"
+                PACKAGES="curl nfs-common"
+                ;;
+            worker2)
+                IP="192.168.60.102"
+                PACKAGES="curl nfs-common"
+                ;;
+            nfs)
+                IP="192.168.60.103"
+                PACKAGES="curl nfs-kernel-server"
+                ;;
+        esac
+        cat <<EOF > "$VM_NAME-cloud-init.yaml"
+#cloud-config
+hostname: ${VM_NAME}
+manage_etc_hosts: true
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - ${IP}/24
+      gateway4: ${GATEWAY_IP}
+      nameservers:
+        addresses:
+          - 8.8.8.8
+packages:
+  - ${PACKAGES}
+EOF
+        log_message "Cloud-init file generated for $VM_NAME."
+    done
 }
 
 # Validate and create host-only network
@@ -147,6 +224,8 @@ main() {
 
     check_dependencies
     validate_and_download_iso
+    generate_preseed_file
+    generate_cloud_init_files
     create_host_only_network
     create_vms
     output_summary
