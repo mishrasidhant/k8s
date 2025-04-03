@@ -12,6 +12,7 @@ exit_on_error() {
 }
 
 # Default configurations
+HOST_ONLY_CIDR="192.168.60.0/24"
 GATEWAY_IP="192.168.60.1"
 VM_BASE_DIR="/vms"
 ISO_DIR="${PWD}"
@@ -32,10 +33,12 @@ DISK_SIZE_NFS="20000"
 VM_NAMES=("controller" "worker1" "worker2" "nfs")
 PREFIX=""
 LOG_FILE="vm_setup.log"
+PRESEED_DIR="${PWD}/preseed"
+FLOPPY_IMAGE="${PRESEED_DIR}/preseed.img"
 
 # Check for dependencies
 check_dependencies() {
-    local dependencies=("VBoxManage" "curl" "wget" "sha256sum")
+    local dependencies=("VBoxManage" "curl" "wget" "sha256sum" "mkfs.msdos" "mcopy")
     for dep in "${dependencies[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
             exit_on_error "Dependency '$dep' is not installed. Please install it and re-run the script."
@@ -74,7 +77,8 @@ validate_and_download_iso() {
 
 # Generate preseed file
 generate_preseed_file() {
-    cat <<EOF > preseed.cfg
+    mkdir -p "$PRESEED_DIR"
+    cat <<EOF > "$PRESEED_DIR/preseed.cfg"
 d-i debian-installer/locale string en_US.UTF-8
 d-i debian-installer/keymap select us
 d-i time/zone string UTC
@@ -98,9 +102,18 @@ d-i grub-installer/bootdev string default
 d-i pkgsel/include string openssh-server
 d-i pkgsel/install-language-support boolean false
 d-i finish-install/reboot_in_progress note
-d-i debian-installer/exit/reboot boolean true
+# To enable auto-reboot, replace the next line with:
+# d-i debian-installer/exit/reboot boolean true
 EOF
-    log_message "Preseed file generated successfully."
+    log_message "Preseed file generated successfully in $PRESEED_DIR."
+}
+
+# Create floppy disk image for the preseed file
+create_floppy_disk() {
+    log_message "Creating floppy disk image for preseed."
+    mkfs.msdos -C "$FLOPPY_IMAGE" 1440 || exit_on_error "Failed to create floppy disk image."
+    mcopy -i "$FLOPPY_IMAGE" "$PRESEED_DIR/preseed.cfg" :: || exit_on_error "Failed to copy preseed file to floppy disk."
+    log_message "Floppy disk image created successfully."
 }
 
 # Generate cloud-init files
@@ -128,7 +141,7 @@ generate_cloud_init_files() {
         esac
         cat <<EOF > "$VM_NAME-cloud-init.yaml"
 #cloud-config
-hostname: ${VM_NAME}
+hostname: ${VM_NAME}.k8s.local
 manage_etc_hosts: true
 network:
   version: 2
@@ -149,7 +162,7 @@ EOF
 
 # Validate and create host-only network
 create_host_only_network() {
-    log_message "Creating host-only network with $GATEWAY_IP/24."
+    log_message "Creating host-only network with CIDR $HOST_ONLY_CIDR."
     VBoxManage hostonlyif create || exit_on_error "Failed to create host-only network."
     NETWORK_NAME=$(VBoxManage list hostonlyifs | grep "^Name:" | awk '{print $2}' | tail -n 1)
 
@@ -203,8 +216,34 @@ create_vms() {
             || exit_on_error "Failed to attach disk for VM $VM_NAME."
         VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 1 --device 0 --type dvddrive --medium "$ISO_DIR/$ISO_NAME" \
             || exit_on_error "Failed to attach ISO for VM $VM_NAME."
+
+        # Attach preseed and cloud-init files
+        attach_files_to_vm "$VM_NAME"
+
+        # Set the boot order to prioritize the Debian ISO
         VBoxManage modifyvm "$VM_NAME" --boot1 dvd --boot2 disk || exit_on_error "Failed to set boot order for VM $VM_NAME."
     done
+}
+
+# Attach preseed and cloud-init files to a VM
+attach_files_to_vm() {
+    VM_NAME="$1"
+
+    # Add a Floppy Controller to the VM
+    log_message "Adding Floppy Controller to VM $VM_NAME."
+    VBoxManage storagectl "$VM_NAME" --name "Floppy Controller" --add floppy \
+        || exit_on_error "Failed to add Floppy Controller to VM $VM_NAME."
+
+    # Attach the preseed floppy disk to the Floppy Controller
+    log_message "Attaching preseed floppy disk to VM $VM_NAME."
+    VBoxManage storageattach "$VM_NAME" --storagectl "Floppy Controller" --port 0 --device 0 --type fdd --medium "$FLOPPY_IMAGE" \
+        || exit_on_error "Failed to attach preseed floppy disk to VM $VM_NAME."
+
+    # Attach the cloud-init file as a virtual CD-ROM to the SATA Controller
+    VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${VM_NAME}-cloud-init.yaml" \
+        || exit_on_error "Failed to attach cloud-init file to VM $VM_NAME."
+
+    log_message "Attached preseed floppy disk and cloud-init file to VM $VM_NAME."
 }
 
 # Output a summary of created VMs
@@ -222,12 +261,31 @@ output_summary() {
 main() {
     log_message "Starting VirtualBox VM setup script."
 
+    # Check for prerequisites
     check_dependencies
+
+    # Validate the chosen IP range
+    validate_ip_range
+
+    # Download and validate the ISO
     validate_and_download_iso
+
+    # Generate the preseed file
     generate_preseed_file
+
+    # Create the floppy disk image
+    create_floppy_disk
+
+    # Generate cloud-init files
     generate_cloud_init_files
+
+    # Create the host-only network
     create_host_only_network
+
+    # Create the virtual machines
     create_vms
+
+    # Output a summary of all the created VMs
     output_summary
 
     log_message "Script completed successfully."
