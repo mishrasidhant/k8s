@@ -17,6 +17,7 @@ GATEWAY_IP="192.168.60.1"
 VM_BASE_DIR="/vms"
 ISO_DIR="${PWD}"
 ISO_NAME="debian-12.10.0-amd64-netinst.iso"
+MODIFIED_ISO_NAME="debian-12.10.0-amd64-netinst-preseeded.iso"
 ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso"
 CHECKSUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS"
 USERNAME="username"
@@ -47,34 +48,169 @@ check_dependencies() {
     log_message "All required dependencies are installed."
 }
 
-# Validate and download Debian ISO
 validate_and_download_iso() {
     CHECKSUM_FILE="SHA256SUMS"
+    TEMP_DIR="${PWD}/iso_temp"
 
-    # Check for ISO file
+    # # Generate the preseed file
+    # generate_preseed
+
+    # Download the ISO if not present
     if [ ! -f "$ISO_NAME" ]; then
         log_message "ISO file not found. Downloading ISO from $ISO_URL."
         wget -q "$ISO_URL" -O "$ISO_NAME" || exit_on_error "Failed to download Debian ISO."
     fi
 
-    # Check for checksum file
+    # Validate the checksum of the ISO
     if [ ! -f "$CHECKSUM_FILE" ]; then
         log_message "Checksum file not found. Downloading checksum file from $CHECKSUM_URL."
         wget -q "$CHECKSUM_URL" -O "$CHECKSUM_FILE" || exit_on_error "Failed to download checksum file."
     fi
 
-    # Validate checksum
     log_message "Validating checksum for $ISO_NAME."
     grep "$ISO_NAME" "$CHECKSUM_FILE" | sha256sum --check > /dev/null 2>&1
     if [ $? -ne 0 ]; then
         log_message "Checksum validation failed for $ISO_NAME."
-        log_message "Expected checksum: $(grep "$ISO_NAME" "$CHECKSUM_FILE" | awk '{print $1}')"
-        log_message "Actual checksum: $(sha256sum "$ISO_NAME" | awk '{print $1}')"
         exit_on_error "Checksum validation failed. Please investigate the issue."
     else
         log_message "Checksum validated successfully."
     fi
+
+    # Extract the ISO contents to a temporary directory
+    mkdir -p "$TEMP_DIR"
+    log_message "Extracting ISO contents to $TEMP_DIR."
+    bsdtar -C "$TEMP_DIR" -xf "$ISO_NAME" || exit_on_error "Failed to extract ISO."
+
+
+    # Add the preseed file to the root of the ISO
+    log_message "Adding preseed file to the ISO."
+    chmod -R +w "$TEMP_DIR/install.amd" || exit_on_error "Failed to add write permissions for extracted ISO contents."
+    gunzip "$TEMP_DIR/install.amd/initrd.gz" || exit_on_error "Failed to unzip initrd.gz."
+    echo "$PRESEED_DIR/preseed.cfg" | cpio -H newc -o -A -F "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to insert preseed into archive"
+    gzip "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to zip initrd."
+
+    # TEMP_INITRD_DIR=$(mktemp -d -p /tmp initrd_contents.XXXXXX)
+    # OLD_DIR=$(pwd)
+    # cd $TEMP_INITRD_DIR
+    # cpio -id < "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to extract initrd contents."
+    # MD5_CHECKSUM=$(md5sum "$TEMP_INITRD_DIR/preseed.cfg" | awk '{print $1}')
+    # cd $OLD_DIR
+    # rm -rf "$TEMP_INITRD_DIR" || echo "WARNING: Failed to cleanup $TEMP_INITRD_DIR"
+
+    chmod -R -w "$TEMP_DIR/install.amd" || exit_on_error "Failed to remove write permissions for extracted ISO contents."
+
+    # Generate checksum for preseed file
+    # MD5_CHECKSUM_LOCAL=$(md5sum "$PRESEED_DIR/preseed.cfg" | awk '{print $1}')
+    # echo "DEBUG: local - $MD5_CHECKSUM_LOCAL"
+    # echo "DEBUG: extracted - $MD5_CHECKSUM"
+
+    # Update menu options for BIOS install
+    echo "Updating menu options for BIOS install for automated setup"
+    chmod +w "$TEMP_DIR/isolinux/isolinux.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
+    chmod +w "$TEMP_DIR/isolinux/menu.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
+# append auto=true priority=critical vga=788 theme=dark quiet --- initrd=/install.amd/initrd.gz preseed/file=/preseed.cfg
+# append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=preseed.cfg preseed-md5=$MD5_CHECKSUM
+    cat <<EOT > "$TEMP_DIR/isolinux/isolinux.cfg"
+prompt 0
+timeout 0
+default custom
+label custom
+    kernel /install.amd/vmlinuz
+    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=preseed.cfg
+EOT
+
+    cat <<EOT > "$TEMP_DIR/isolinux/menu.cfg"
+menu title Custom Installer Menu
+label custom
+    menu label Custom Installation
+    kernel /install.amd/vmlinuz
+    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=preseed.cfg
+EOT
+    chmod -w "$TEMP_DIR/isolinux/isolinux.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
+    chmod -w "$TEMP_DIR/isolinux/menu.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
+
+    # Update grub to trigger automated install instead of loading menu
+    chmod +w "$TEMP_DIR/boot/grub/grub.cfg" || exit_on_error "Failed to addd write permission on grub.cfg"
+    # Append the new menuentry to the grub.cfg
+    #linux    /install.amd/vmlinuz auto=true priority=critical console=tty1 console=ttyS0,115200n8 vga=788 theme=dark --- quiet 
+    cat <<EOT > "$TEMP_DIR/boot/grub/grub.cfg"
+set default=1
+set timeout=0
+set debug=all
+menuentry 'Custom' {
+    set background_color=black
+    linux    /install.amd/vmlinuz auto=true priority=critical vga=788 theme=dark --- quiet 
+    initrd   /install.amd/initrd.gz
 }
+menuentry 'Debug' {
+    echo "Debugging grub configuration"
+}
+EOT
+    chmod -w "$TEMP_DIR/boot/grub/grub.cfg" || exit_on_error "Failed to remove write permission on grub.cfg"
+
+    # Regenerating md5sum.txt
+    OLD_DIR=$(pwd)
+    cd $TEMP_DIR
+    chmod +w md5sum.txt || exit_on_error "Failed to add write permission on checksum file"
+    find -follow -type f ! -name md5sum.txt -print0 | xargs -0 md5sum > md5sum.txt || exit_on_error "Failed to renegeerate checksum file"
+    chmod -w md5sum.txt || exit_on_error "Failed to remove write permission on checksum file"
+    cd $OLD_DIR
+
+    # Modify isolinux.cfg to reference the preseed file
+    # log_message "Updating boot parameters in isolinux.cfg."
+    # ISOLINUX_CFG="$TEMP_DIR/isolinux/isolinux.cfg"
+    # if [ -f "$ISOLINUX_CFG" ] && [ -w "$ISOLINUX_CFG" ]; then
+    #     sed -i 's|append|append preseed/file=/cdrom/preseed.cfg|' "$ISOLINUX_CFG" || exit_on_error "Failed to update isolinux.cfg."
+    # else
+    #     exit_on_error "isolinux.cfg not found or not writable."
+    # fi
+
+    # Rebuild the ISO with genisoimage
+    log_message "Rebuilding modified ISO."
+    chmod +w "$TEMP_DIR/isolinux/isolinux.bin" || exit_on_error "Failed to add write perm to isolinux.bin"
+    genisoimage -r -J -b isolinux/isolinux.bin -c isolinux/boot.cat \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -o "$MODIFIED_ISO_NAME" "$TEMP_DIR" || exit_on_error "Failed to rebuild ISO."
+    chmod -w "$TEMP_DIR/isolinux/isolinux.bin" || exit_on_error "Failed to remove write perm on isolinux.bin"
+
+    # Clean up temporary directory
+    # TODO Uncomment once verified
+    #rm -rf "$TEMP_DIR"
+    log_message "Modified ISO created successfully: $MODIFIED_ISO_NAME."
+
+    # Update ISO_NAME to use the modified version
+    #ISO_NAME="$MODIFIED_ISO_NAME"
+}
+
+
+# # Validate and download Debian ISO
+# validate_and_download_iso() {
+#     CHECKSUM_FILE="SHA256SUMS"
+
+#     # Check for ISO file
+#     if [ ! -f "$ISO_NAME" ]; then
+#         log_message "ISO file not found. Downloading ISO from $ISO_URL."
+#         wget -q "$ISO_URL" -O "$ISO_NAME" || exit_on_error "Failed to download Debian ISO."
+#     fi
+
+#     # Check for checksum file
+#     if [ ! -f "$CHECKSUM_FILE" ]; then
+#         log_message "Checksum file not found. Downloading checksum file from $CHECKSUM_URL."
+#         wget -q "$CHECKSUM_URL" -O "$CHECKSUM_FILE" || exit_on_error "Failed to download checksum file."
+#     fi
+
+#     # Validate checksum
+#     log_message "Validating checksum for $ISO_NAME."
+#     grep "$ISO_NAME" "$CHECKSUM_FILE" | sha256sum --check > /dev/null 2>&1
+#     if [ $? -ne 0 ]; then
+#         log_message "Checksum validation failed for $ISO_NAME."
+#         log_message "Expected checksum: $(grep "$ISO_NAME" "$CHECKSUM_FILE" | awk '{print $1}')"
+#         log_message "Actual checksum: $(sha256sum "$ISO_NAME" | awk '{print $1}')"
+#         exit_on_error "Checksum validation failed. Please investigate the issue."
+#     else
+#         log_message "Checksum validated successfully."
+#     fi
+# }
 
 # Generate preseed dependencies (file and ISO)
 generate_preseed() {
@@ -107,16 +243,15 @@ d-i finish-install/reboot_in_progress note
 # d-i debian-installer/exit/reboot boolean true
 EOF
     log_message "Preseed file generated successfully in $PRESEED_DIR."
-
-    create_preseed_iso
+    # create_preseed_iso
 }
 
 # Create ISO image from preseed file
-create_preseed_iso(){
-    genisoimage -output "${PRESEED_DIR}/preseed.iso" -volid cidata -joliet -rock "$PRESEED_DIR/preseed.cfg" \
-    || exit_on_error "Failed to create preseed ISO."
-    log_message "Preseed ISO created."
-}
+# create_preseed_iso(){
+#     genisoimage -output "${PRESEED_DIR}/preseed.iso" -volid cidata -joliet -rock "$PRESEED_DIR/preseed.cfg" \
+#     || exit_on_error "Failed to create preseed ISO."
+#     log_message "Preseed ISO created."
+# }
 
 # Create floppy disk image for the preseed file
 # create_floppy_disk() {
@@ -230,12 +365,12 @@ create_vms() {
             || exit_on_error "Failed to create disk for VM $VM_NAME."
         VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 0 --device 0 --type hdd --medium "${VM_DIR}/${VM_NAME}.vdi" \
             || exit_on_error "Failed to attach disk for VM $VM_NAME."
-        VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 1 --device 0 --type dvddrive --medium "$ISO_DIR/$ISO_NAME" \
+        VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 1 --device 0 --type dvddrive --medium "$ISO_DIR/$MODIFIED_ISO_NAME" \
             || exit_on_error "Failed to attach ISO for VM $VM_NAME."
 
         # Attach preseed ISO as a virtual CD-ROM to the SATA Controller
-        VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${PRESEED_DIR}/preseed.iso" \
-            || exit_on_error "Failed to attach preseed ISO to VM $VM_NAME."
+        # VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 2 --device 0 --type dvddrive --medium "${PRESEED_DIR}/preseed.iso" \
+        #     || exit_on_error "Failed to attach preseed ISO to VM $VM_NAME."
 
         # Attach the cloud-init ISO as a virtual CD-ROM to the SATA Controller
         VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 3 --device 0 --type dvddrive --medium "${CLOUDINIT_DIR}/${VM_NAME}-cloud-init.iso" \
@@ -245,9 +380,9 @@ create_vms() {
         # attach_files_to_vm "$VM_NAME"
 
         # Add kernel boot parameters for the preseed file
-        log_message "Adding kernel boot parameters for preseed to VM $VM_NAME."
-        VBoxManage setextradata "$VM_NAME" "VBoxInternal/Devices/pcbios/0/Config/DmiBIOSVersion" "auto=true DEBIAN_FRONTEND=text preseed/file=/cdrom/preseed.cfg" \
-            || exit_on_error "Failed to add boot parameters to VM $VM_NAME."
+        # log_message "Adding kernel boot parameters for preseed to VM $VM_NAME."
+        # VBoxManage setextradata "$VM_NAME" "VBoxInternal/Devices/pcbios/0/Config/DmiBIOSVersion" "auto=true DEBIAN_FRONTEND=text preseed/file=/cdrom/preseed.cfg" \
+            # || exit_on_error "Failed to add boot parameters to VM $VM_NAME."
 
         # Set the boot order to prioritize the Debian ISO
         VBoxManage modifyvm "$VM_NAME" --boot1 dvd --boot2 dvd --boot3 disk || exit_on_error "Failed to set boot order for VM $VM_NAME."
@@ -307,11 +442,12 @@ main() {
     validate_ip_range
     # TODO Add this function back in ^
 
+    # # Generate and package preseed file
+    generate_preseed
+
     # Download and validate the ISO
     validate_and_download_iso
 
-    # Generate and package preseed file
-    generate_preseed
 
     # # Create the floppy disk image
     # create_floppy_disk
