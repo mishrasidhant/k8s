@@ -86,7 +86,11 @@ validate_and_download_iso() {
     log_message "Adding preseed file to the ISO."
     chmod -R +w "$TEMP_DIR/install.amd" || exit_on_error "Failed to add write permissions for extracted ISO contents."
     gunzip "$TEMP_DIR/install.amd/initrd.gz" || exit_on_error "Failed to unzip initrd.gz."
-    echo "$PRESEED_DIR/preseed.cfg" | cpio -H newc -o -A -F "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to insert preseed into archive"
+    MD5_CHECKSUM=$(md5sum "$PRESEED_DIR/preseed.cfg" | awk '{print $1}')
+    # b612c00f058da58b6018af07e6003481  preseed/preseed.cfg
+    # CD and find to pass relative path and have the contents stored within initrd - not original path
+    (cd "$PRESEED_DIR" && find "preseed.cfg" | cpio -H newc -o -A -F "$TEMP_DIR/install.amd/initrd") || exit_on_error "Failed to insert preseed into archive"
+    # echo "$PRESEED_DIR/preseed.cfg" | cpio -H newc -o -A -F "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to insert preseed into archive"
     gzip "$TEMP_DIR/install.amd/initrd" || exit_on_error "Failed to zip initrd."
 
     # TEMP_INITRD_DIR=$(mktemp -d -p /tmp initrd_contents.XXXXXX)
@@ -116,7 +120,7 @@ timeout 0
 default custom
 label custom
     kernel /install.amd/vmlinuz
-    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=preseed.cfg
+    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=/preseed.cfg preseed-md5=$MD5_CHECKSUM
 EOT
 
     cat <<EOT > "$TEMP_DIR/isolinux/menu.cfg"
@@ -124,7 +128,7 @@ menu title Custom Installer Menu
 label custom
     menu label Custom Installation
     kernel /install.amd/vmlinuz
-    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=preseed.cfg
+    append auto=true priority=critical vga=788 initrd=/install.amd/initrd.gz theme=dark --- file=/preseed.cfg preseed-md5=$MD5_CHECKSUM
 EOT
     chmod -w "$TEMP_DIR/isolinux/isolinux.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
     chmod -w "$TEMP_DIR/isolinux/menu.cfg" || exit_on_error "Failed to addd write permission on isolinux.cfg"
@@ -172,6 +176,16 @@ EOT
         -no-emul-boot -boot-load-size 4 -boot-info-table \
         -o "$MODIFIED_ISO_NAME" "$TEMP_DIR" || exit_on_error "Failed to rebuild ISO."
     chmod -w "$TEMP_DIR/isolinux/isolinux.bin" || exit_on_error "Failed to remove write perm on isolinux.bin"
+
+    # Uncomment this section to debug checksum inside ISO
+    # TMP_MNT_DIR=$(mktemp -d -p /tmp mnt-iso.XXXX)
+    # TMP_CFG_DIR=$(mktemp -d -p /tmp mnt-cfg.XXXX)
+    # sudo xorriso -osirrox on -indev "./$MODIFIED_ISO_NAME" -extract / $TMP_MNT_DIR
+    # gzip -dc "$TMP_MNT_DIR/install.amd/initrd.gz" | cpio -idmv -D $TMP_CFG_DIR
+    # MD5_CHECKSUM_ISO=$(md5sum "$TMP_CFG_DIR/preseed.cfg" | awk '{print $1}')
+    # log_message "DEBUG: Checksum from repo - $MD5_CHECKSUM"
+    # log_message "DEBUG: Checksum extracted from iso - $MD5_CHECKSUM_ISO"
+
 
     # Clean up temporary directory
     # TODO Uncomment once verified
